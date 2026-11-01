@@ -1,0 +1,14 @@
+Function Main(args As Array Of String) As Integer
+    StdOut.Write("What is your name? ")
+    StdOut.Flush()
+    Dim name As Optional Of String = StdIn.ReadLine()
+    If Not name.HasValue Then
+        StdErr.WriteLine("No name received on standard input.")
+        Return 1
+    End If
+    Print "Ahoy, " + name.Value + "!"
+    For i As Integer = 1 To args.Count - 1
+        StdOut.WriteLine("Argument: " + args(i))
+    Next
+    Return 0
+End Function

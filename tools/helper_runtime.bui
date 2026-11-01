@@ -1,0 +1,259 @@
+' Shared POSIX build/test orchestration. No Python runtime is involved.
+#If TargetWindows Then
+Declare Function SystemCommand Lib "ucrtbase" Alias "system" (command As String) As Int32
+#Else
+Declare Function SystemCommand Lib "c" Alias "system" (command As String) As Int32
+#End If
+
+Public Function Q(text As String) As String
+    Return "'" + String.Replace(text, "'", "'\"'\"'", String.Len(text) + 1, True) + "'"
+End Function
+
+Private Function AtDirectory(command As String, cwd As String) As String
+    If cwd = "" Then
+        Return command
+    End If
+    Return "cd " + Q(cwd) + " && " + command
+End Function
+
+Public Function Run(command As String, cwd As String = "") As Integer
+    StdOut.Flush()
+    Dim status As Integer = SystemCommand(AtDirectory(command, cwd))
+    If status = -1 Then
+        Return 1
+    End If
+    If (status Mod 128) <> 0 Then
+        Return 128 + status Mod 128
+    End If
+    Return (status \ 256) Mod 256
+End Function
+
+Public Sub RequireRun(command As String, cwd As String = "")
+    Dim status As Integer = Run(command, cwd)
+    If status <> 0 Then
+        Throw New RuntimeException("Command failed with exit " + Str(status) + ": " + command, status)
+    End If
+End Sub
+
+Public Function Capture(command As String, cwd As String = "", timeout As Integer = 30000) As String
+    Dim shell As New Shell
+    shell.Timeout = timeout
+    Try
+        Dim output As String = shell.Execute(AtDirectory(command, cwd))
+        If shell.LastExitCode <> 0 Then
+            Throw New RuntimeException("Command failed with exit " + Str(shell.LastExitCode) + ": " + command + "\n" + output, shell.LastExitCode)
+        End If
+        Return output
+    Finally
+        shell.Close()
+    End Try
+End Function
+
+Public Function WorkspaceRoot() As String
+    Dim entry As String = System.EnvironmentVariable("AHOY_SCRIPT").Or("")
+    If entry = "" Then
+        entry = String.Trim(Capture("pwd -P"))
+    End If
+    Dim folder As New FileSystemItem(entry)
+    If folder.IsFile() Then
+        folder = folder.Parent
+    End If
+    While folder <> Nil
+        If folder.Child("buoy-llms.txt").IsFile() And folder.Child("libraries").IsFolder() Then
+            Return folder.FullPath()
+        End If
+        folder = folder.Parent
+    End While
+    Throw New RuntimeException("Cannot locate Buoy workspace; run from its root or use buoy-run.")
+End Function
+
+Public Function ReadText(filename As String) As String
+    Dim file As New FileSystemItem(filename)
+    Dim outcome As Result Of String, String = file.ReadAllText()
+    If outcome.IsErr Then
+        Throw New RuntimeException("Cannot read " + filename + ": " + outcome.Error)
+    End If
+    Return outcome.Value
+End Function
+
+Public Sub WriteText(filename As String, text As String)
+    Dim file As New FileSystemItem(filename)
+    Dim outcome As Result Of Integer, String = file.WriteAllText(text)
+    If outcome.IsErr Then
+        Throw New RuntimeException("Cannot write " + filename + ": " + outcome.Error)
+    End If
+End Sub
+
+Public Sub MakeDirectory(filename As String)
+    Dim folder As New FileSystemItem(filename)
+    If Not folder.CreateFolder(True) Then
+        Throw New RuntimeException("Cannot create directory " + filename)
+    End If
+End Sub
+
+Public Function TempDirectory(prefix As String = "buoy-helper-") As String
+    Dim location As String = System.EnvironmentVariable("TMPDIR").Or("/tmp")
+    Return String.Trim(Capture("mktemp -d " + Q(Path.Join(location, prefix + "XXXXXX"))))
+End Function
+
+Public Sub RemoveTree(filename As String)
+    If filename = "" Or filename = "/" Then
+        Throw New RuntimeException("Refusing invalid cleanup path")
+    End If
+    RequireRun("/bin/rm -rf " + Q(filename))
+End Sub
+
+Public Function Sources(folderPath As String, prefix As String = "", suffix As String = ".bui") As Array Of String
+    Dim files As Array Of String = []
+    Dim folder As New FileSystemItem(folderPath)
+    For Each item As FileSystemItem In folder.Children()
+        If item.IsFile() And String.StartsWith(item.Name(), prefix, True) And String.EndsWith(item.Name(), suffix, True) Then
+            Array.Append(files, item.FullPath())
+        End If
+    Next
+    Array.Sort(files)
+    Return files
+End Function
+
+Public Sub Check(source As String, target As String = "")
+    Dim command As String = "buoy " + Q(source) + " --check --diagnostic-format json"
+    If target <> "" Then
+        command = command + " --target " + Q(target)
+    End If
+    Dim output As String = Capture(command, WorkspaceRoot(), 120000)
+    Dim diagnostics As JSONItem = Json.Parse(output)
+    If diagnostics.Value("errors").Count() <> 0 Then
+        Throw New RuntimeException(output)
+    End If
+    If diagnostics.Value("warnings").Count() <> 0 Then
+        StdErr.WriteLine(Json.Stringify(diagnostics.Value("warnings")))
+    End If
+End Sub
+
+Public Function BuildPackage(name As String) As String
+    Dim root As String = WorkspaceRoot()
+    Dim source As String = Path.Join(root, "libraries/" + name)
+    Dim manifest As JSONItem = Json.Parse(ReadText(Path.Join(source, "manifest.json")))
+    Dim version As String = manifest.Value("version").AsString().Or("")
+    If version = "" Then
+        Throw New RuntimeException("Missing package version: " + source)
+    End If
+    MakeDirectory(Path.Join(root, "packages"))
+    MakeDirectory(Path.Join(root, "dist"))
+    Dim output As String = Path.Join(root, "packages/" + name + "-" + version + ".buipkg")
+    Dim packager As String = System.EnvironmentVariable("BPM_PACKAGER").Or("")
+    If packager = "" Then
+        packager = "buoy"
+        Dim installedPackager As New FileSystemItem("/usr/bin/buoy")
+        If installedPackager.IsFile() Then packager = installedPackager.FullPath()
+    End If
+    RequireRun(Q(packager) + " pkg seal " + Q(source) + " -o " + Q(output), root)
+    ' Remove stale active versions only after sealing the replacement succeeds.
+    For Each stale As String In Sources(Path.Join(root, "packages"), name + "-", ".buipkg")
+        If String.Compare(stale, output, True) <> 0 Then
+            Dim file As New FileSystemItem(stale)
+            If Not file.Delete() Then
+                Throw New RuntimeException("Cannot remove old package " + stale)
+            End If
+        End If
+    Next
+    Dim archive As New FileSystemItem(output)
+    Dim destination As New FileSystemItem(Path.Join(root, "dist/" + archive.Name()))
+    If Not archive.CopyTo(destination) Then
+        Throw New RuntimeException("Cannot copy " + output + " to dist")
+    End If
+    Return output
+End Function
+
+Public Function CompileWorkspace() As String
+    Dim root As String = WorkspaceRoot()
+    Dim work As String = TempDirectory("buoy-calls-source-")
+    Try
+        For Each relative As String In ["apps/Calls", "libraries/couchdb", "libraries/scraping", "libraries/keychain", "libraries/desktopmenus"]
+            Dim destination As New FileSystemItem(Path.Join(work, relative))
+            MakeDirectory(destination.ParentPath())
+            RequireRun("cp -R " + Q(Path.Join(root, relative)) + " " + Q(destination.FullPath()))
+        Next
+        MakeDirectory(Path.Join(work, "packages"))
+        For Each name As String In ["couchdb", "scraping", "keychain", "desktopmenus"]
+            For Each source As String In Sources(Path.Join(root, "packages"), name + "-", ".buipkg")
+                Dim file As New FileSystemItem(source)
+                Dim destination As New FileSystemItem(Path.Join(work, "packages/" + file.Name()))
+                If Not file.CopyTo(destination) Then
+                    Throw New RuntimeException("Cannot copy package " + source)
+                End If
+            Next
+        Next
+        MakeDirectory(Path.Join(work, "tests"))
+        For Each source As String In Sources(Path.Join(root, "tests"))
+            Dim file As New FileSystemItem(source)
+            If String.StartsWith(file.Name(), "couchdb", True) Or file.Name() = "call_models_test.bui" Or file.Name() = "keychain_test.bui" Or file.Name() = "call_jobs_test.bui" Or file.Name() = "scraping_queue_test.bui" Or file.Name() = "calls_repository_live_test.bui" Then
+                Dim destination As New FileSystemItem(Path.Join(work, "tests/" + file.Name()))
+                If Not file.CopyTo(destination) Then
+                    Throw New RuntimeException("Cannot copy test " + source)
+                End If
+            End If
+        Next
+        Return work
+    Catch e As Exception
+        RemoveTree(work)
+        Throw e
+    End Try
+End Function
+
+Public Function DesktopOutput(name As String) As String
+    Dim suffix As String = ""
+    If String.Trim(Capture("uname -s")) = "Darwin" Then
+        suffix = ".app"
+    End If
+    Return Path.Join(WorkspaceRoot(), "dist/" + name + suffix)
+End Function
+
+Public Function BuildCalls() As String
+    Dim root As String = WorkspaceRoot()
+    BuildPackage("couchdb")
+    BuildPackage("scraping")
+    BuildPackage("keychain")
+    BuildPackage("desktopmenus")
+    For Each source As String In Sources(Path.Join(root, "apps/Calls"))
+        Check(source)
+    Next
+    Check(Path.Join(root, "libraries/scraping/modules/Scraping.bui"))
+    Dim output As String = DesktopOutput("BuoyCalls")
+    Dim work As String = CompileWorkspace()
+    Try
+        Dim command As String = "buoy " + Q(Path.Join(work, "apps/Calls/main.bui")) + " --app-type desktop --bundle-id com.example.buoycalls --info-plist " + Q(Path.Join(root, "apps/Calls/Info.plist")) + " -o " + Q(output)
+        #If TargetMac Then
+            Dim identity As String = System.EnvironmentVariable("BUOY_CODESIGN_IDENTITY").Or("")
+            If identity <> "" Then command += " --codesign-identity=" + Q(identity)
+        #End If
+        RequireRun(command, work)
+    Finally
+        RemoveTree(work)
+    End Try
+    Print "Built " + output
+    Return output
+End Function
+
+Public Function BuildDocs() As String
+    Dim root As String = WorkspaceRoot()
+    Dim app As String = Path.Join(root, "apps/BuoyDocs")
+    Dim snapshot As JSONItem = Json.Parse(ReadText(Path.Join(app, "snapshot/docs.json")))
+    If snapshot.Value("pages").Count() = 0 Then
+        Throw New RuntimeException("Empty docs snapshot; run buoy-run tools/index_buoy_docs.bui")
+    End If
+    ' Escaping < prevents embedded documentation from terminating the JSON script.
+    ' JSON permits UTF-8 directly; line separators are escaped for older JS engines.
+    Dim data As String = String.Replace(Json.Stringify(snapshot), "<", "\\u003c")
+    data = String.Replace(data, String.Chr(8232), "\\u2028")
+    data = String.Replace(data, String.Chr(8233), "\\u2029")
+    Dim html As String = String.Replace(ReadText(Path.Join(app, "viewer.html")), "__DOCS_JSON__", data, 1, True)
+    WriteText(Path.Join(app, "resources/viewer.html"), html)
+    Dim source As String = Path.Join(app, "main.bui")
+    Check(source)
+    Dim output As String = DesktopOutput("BuoyDocs")
+    MakeDirectory(Path.Join(root, "dist"))
+    RequireRun("buoy " + Q(source) + " --app-type desktop -o " + Q(output), root)
+    Print "Built " + output + " with " + Str(snapshot.Value("pages").Count()) + " offline pages"
+    Return output
+End Function

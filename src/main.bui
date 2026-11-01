@@ -1,0 +1,671 @@
+' POSIX Buoy script runner. Child processes inherit the terminal and standard IO.
+Declare Function RunCommand Lib "c" Alias "system" (command As String) As Int32
+#If TargetLinux Then
+    ' Runtime resolution avoids the allocated-output realpath binding defect.
+    Optional Declare Function ResolvePath Lib "c" Alias "realpath" (filename As String, buffer As Ptr) As Ptr
+#Else
+    Declare Function ResolvePath Lib "c" Alias "realpath" (filename As String, buffer As Ptr) As Ptr
+#End If
+Declare Function MakeSymlink Lib "c" Alias "symlink" (target As String, linkName As String) As Int32
+Declare Sub FreeMemory Lib "c" Alias "free" (buffer As Ptr)
+
+Function Quote(text As String) As String
+    Return "'" + String.Replace(text, "'", "'\"'\"'", String.Len(text) + 1, True) + "'"
+End Function
+
+Sub CopyBuoySources(original As FileSystemItem, destination As FileSystemItem)
+    If Not destination.CreateFolder(True) Then
+        Throw New Exception("buoy-run: cannot create helper source directory")
+    End If
+    For Each item As FileSystemItem In original.Children()
+        If item.IsFolder() And Not String.StartsWith(item.Name(), ".", True) Then
+            CopyBuoySources(item, destination.Child(item.Name()))
+        ElseIf item.IsFile() And String.EndsWith(item.Name(), ".bui", True) Then
+            If Not item.CopyTo(destination.Child(item.Name())) Then
+                Throw New Exception("buoy-run: cannot stage " + item.FullPath())
+            End If
+        End If
+    Next
+End Sub
+
+Sub LinkPackages(original As FileSystemItem, destination As FileSystemItem)
+    If Not original.IsFolder() Then Return
+    For Each item As FileSystemItem In original.Children()
+        If item.IsFile() And String.EndsWith(item.Name(), ".buipkg", True) Then
+            Dim target As FileSystemItem = destination.Child(item.Name())
+            If Not target.Exists() Then
+                If MakeSymlink(item.FullPath(), target.FullPath()) <> 0 Then
+                    Throw New Exception("buoy-run: cannot stage package " + item.Name())
+                End If
+            End If
+        End If
+    Next
+End Sub
+
+Function WorkspaceHelperRoot(source As FileSystemItem, body As String) As String
+    If Not String.Contains(body, "helper_runtime", True) Then
+        Return ""
+    End If
+    Dim ancestor As FileSystemItem = source.Parent
+    While ancestor <> Nil
+        If ancestor.Child("buoy-llms.txt").IsFile() And ancestor.Child("tools/helper_runtime.bui").IsFile() Then
+            Return ancestor.FullPath()
+        End If
+        ancestor = ancestor.Parent
+    End While
+    Return ""
+End Function
+
+Sub Usage()
+    Print "buoy-run — compile and run a Buoy script"
+    Print "Usage: buoy-run <script.bui> [arguments ...]"
+    Print "       buoy-run repl"
+    Print "       buoy-run --help | --version"
+    Print "Scripts may start with #!/usr/bin/env buoy-run"
+End Sub
+
+Function Main(args As Array Of String) As Integer
+    If args.Count < 2 Then
+        Usage()
+        Return 2
+    End If
+    If args(1) = "--help" Or args(1) = "-h" Then
+        Usage()
+        Return 0
+    End If
+    If args(1) = "--version" Then
+        Print "buoy-run 0.1.0"
+        Return 0
+    End If
+
+    If args(1) = "repl" Then
+        If args.Count > 2 Then
+            If args.Count = 3 And (args(2) = "--help" Or args(2) = "-h") Then
+                ReplHelp()
+                Return 0
+            End If
+            StdErr.WriteLine("Usage: buoy-run repl [--help]")
+            Return 2
+        End If
+        Return RunRepl()
+    End If
+
+    Dim resolved As Ptr = ResolvePath(args(1), Nil)
+    If resolved = Nil Then
+        StdErr.WriteLine("buoy-run: cannot resolve script: " + args(1))
+        Return 1
+    End If
+    Dim sourcePath As String = CType(CType(resolved, CString), String)
+    Dim source As New FileSystemItem(sourcePath)
+    If Not source.IsFile() Then
+        StdErr.WriteLine("buoy-run: expected a file: " + args(1))
+        FreeMemory(resolved)
+        Return 1
+    End If
+    Dim contents As Result Of String, String = source.ReadAllText()
+    If contents.IsErr Then
+        StdErr.WriteLine("buoy-run: " + contents.Error)
+        FreeMemory(resolved)
+        Return 1
+    End If
+
+    Dim tempRoot As String = System.EnvironmentVariable("TMPDIR").Or("/tmp")
+    Dim setup As New Shell
+    Dim tempPath As String = String.Trim(setup.Execute("mktemp -d " + Quote(Path.Join(tempRoot, "buoy-run-XXXXXX"))))
+    Dim setupStatus As Integer = setup.LastExitCode
+    setup.Close()
+    Dim work As New FileSystemItem(tempPath)
+    If setupStatus <> 0 Or Not work.IsFolder() Then
+        StdErr.WriteLine("buoy-run: cannot create temporary directory: " + tempPath)
+        FreeMemory(resolved)
+        Return 1
+    End If
+    Dim compilerSource As String = sourcePath
+    Dim status As Integer = 1
+    Try
+        ' Build/test helpers import modules across tools/ and tests/. The compiler
+        ' otherwise discovers both desktop manifests at their common repo root.
+        ' Stage just helper source modules, retaining their relative import paths.
+        Dim helperRoot As String = WorkspaceHelperRoot(source, contents.Value)
+        If helperRoot <> "" Then
+            Dim original As New FileSystemItem(helperRoot)
+            Dim staged As FileSystemItem = work.Child("source")
+            CopyBuoySources(original.Child("tools"), staged.Child("tools"))
+            CopyBuoySources(original.Child("tests"), staged.Child("tests"))
+            Dim stagedPackages As FileSystemItem = staged.Child("packages")
+            If Not stagedPackages.CreateFolder(True) Then Throw New Exception("buoy-run: cannot create helper packages")
+            LinkPackages(original.Child("packages"), stagedPackages)
+            ' A fresh project needs the installed archives, not the original
+            ' workspace's extracted cache. Never modify workspace packages.
+            Dim packageOverride As String = System.EnvironmentVariable("BUOY_RUN_PACKAGES").Or(System.EnvironmentVariable("AHOY_PACKAGES").Or(""))
+            If packageOverride <> "" Then
+                LinkPackages(New FileSystemItem(packageOverride), stagedPackages)
+            Else
+                #If TargetMac Then
+                    LinkPackages(New FileSystemItem("/Applications/Buoy/packages"), stagedPackages)
+                #Else
+                    LinkPackages(New FileSystemItem("/usr/share/buoy/packages"), stagedPackages)
+                #End If
+            End If
+            compilerSource = staged.FullPath() + String.Substring(sourcePath, String.Len(helperRoot))
+        End If
+        If String.StartsWith(contents.Value, "#!", True) Then
+            ' Comment out the directive, retaining source line numbers.
+            Dim normalized As FileSystemItem = work.Child(source.Name())
+            If helperRoot <> "" Then
+                normalized = New FileSystemItem(compilerSource)
+            End If
+            If Not String.EndsWith(normalized.Name(), ".bui", True) Then
+                normalized = New FileSystemItem(normalized.FullPath() + ".bui")
+            End If
+            Dim written As Result Of Integer, String = normalized.WriteAllText("' " + contents.Value)
+            If written.IsErr Then
+                StdErr.WriteLine("buoy-run: " + written.Error)
+                Return 1
+            End If
+            compilerSource = normalized.FullPath()
+
+            ' Preserve package discovery for the temporary source.
+            Dim ancestor As FileSystemItem = source.Parent
+            If helperRoot <> "" Then
+                ancestor = Nil
+            End If
+            While ancestor <> Nil
+                Dim packages As FileSystemItem = ancestor.Child("packages")
+                If packages.IsFolder() Then
+                    If MakeSymlink(packages.FullPath(), work.Child("packages").FullPath()) <> 0 Then
+                        StdErr.WriteLine("buoy-run: cannot link script packages")
+                        Return 1
+                    End If
+                    Exit While
+                End If
+                ancestor = ancestor.Parent
+            End While
+        End If
+
+        Dim compiler As String = System.EnvironmentVariable("BUOY_RUN_BUOY").Or(System.EnvironmentVariable("AHOY_BUOY").Or("buoy"))
+        Dim binary As String = work.Child("program").FullPath()
+        Dim compile As String = Quote(compiler) + " " + Quote(compilerSource) + " --module-dir " + Quote(source.ParentPath()) + " -o " + Quote(binary)
+        Dim run As String = "BUOY_RUN_SCRIPT=" + Quote(sourcePath) + " AHOY_SCRIPT=" + Quote(sourcePath) + " " + Quote(binary)
+        For i As Integer = 2 To args.Count - 1
+            run = run + " " + Quote(args(i))
+        Next
+        ' system() preserves stdin/stdout/stderr and has no execution timeout.
+        StdOut.Flush()
+        Dim rawStatus As Integer = RunCommand(compile + " && " + run)
+        If rawStatus = -1 Then
+            StdErr.WriteLine("buoy-run: failed to launch compiler or program")
+            Return 1
+        End If
+        If (rawStatus Mod 128) <> 0 Then
+            status = 128 + (rawStatus Mod 128)
+        Else
+            status = (rawStatus \ 256) Mod 256
+        End If
+    Catch error As Exception
+        StdErr.WriteLine(error.Message)
+        Return 1
+    Finally
+        ' rm does not follow package symlinks; recursive FileSystemItem.Delete does.
+        RunCommand("/bin/rm -rf " + Quote(tempPath))
+        FreeMemory(resolved)
+    End Try
+    Return status
+End Function
+
+' A compiled scratchpad: every submission runs once in a fresh process.
+Declare Function ReplSystem Lib "c" Alias "system" (command As String) As Int32
+Declare Function ReplWrite Lib "c" Alias "write" (fd As Int32, text As String, count As Integer) As Integer
+Declare Function ReplIsTerminal Lib "c" Alias "isatty" (fd As Int32) As Int32
+
+Private Function Q(text As String) As String
+    Return "'" + String.Replace(text, "'", "'\"'\"'", String.Len(text) + 1, True) + "'"
+End Function
+
+Private Function Status(raw As Integer) As Integer
+    If raw = -1 Then Return 1
+    If raw Mod 128 <> 0 Then Return 128 + raw Mod 128
+    Return (raw \ 256) Mod 256
+End Function
+
+Sub ReplHelp()
+    StdErr.WriteLine("Usage: buoy-run repl")
+    StdErr.WriteLine("Enter a Buoy statement, or ? expression to print a value.")
+    StdErr.WriteLine("Each submission runs once in a fresh process; variables do not carry over.")
+    StdErr.WriteLine("Buoy blocks collect automatically: If / End If, For / Next, Function / End Function, etc.")
+    StdErr.WriteLine("Function/type declarations are remembered; :defs lists them.")
+    StdErr.WriteLine(":begin   optional explicit block; :end compiles and runs it")
+    StdErr.WriteLine(":program collect a complete program with its own Main; finish with :end")
+    StdErr.WriteLine(":cancel  discard the block being entered")
+    StdErr.WriteLine(":show    show the current block, or the last successful submission")
+    StdErr.WriteLine(":run     explicitly rerun the last successful submission")
+    StdErr.WriteLine(":reset   clear remembered definitions and previous submission")
+    StdErr.WriteLine(":help    show this help; :quit exits (Ctrl-D also exits)")
+End Sub
+
+Private Function Evaluate(body As String, complete As Boolean, work As FileSystemItem, compiler As String, cwd As String, definitions As String = "", validationOnly As Boolean = False) As Boolean
+    Dim source As FileSystemItem = work.Child("submission.bui")
+    Dim generated As String = definitions + body
+    Dim definitionLines As Integer = String.Split(definitions, "\n").Count - 1
+    Dim offset As Integer = definitionLines
+    If Not complete Then
+        generated = definitions + "Sub Main()\n" + body + "\nEnd Sub\n"
+        offset = definitionLines + 1
+    End If
+    Dim written As Result Of Integer, String = source.WriteAllText(generated)
+    If written.IsErr Then Throw New Exception(written.Error)
+    Dim command As String = Q(compiler) + " " + Q(source.FullPath()) + " --module-dir " + Q(cwd)
+    Dim check As New Shell()
+    Dim diagnosticsText As String = ""
+    Dim checked As Integer = 1
+    Try
+        diagnosticsText = check.Execute(command + " --check --diagnostic-format json")
+        checked = check.LastExitCode
+    Finally
+        check.Close()
+    End Try
+    Dim parsed As Optional Of JSONItem = Json.TryParse(diagnosticsText)
+    If Not parsed.HasValue Then
+        StdErr.WriteLine(diagnosticsText)
+        Return False
+    End If
+    Dim diagnostics As JSONItem = parsed.Value
+    If Not diagnostics.IsObject() Then
+        StdErr.WriteLine("buoy-run repl: malformed compiler diagnostics: expected an object with errors and warnings arrays")
+        Return False
+    End If
+    If Not diagnostics.Value("errors").IsArray() Or Not diagnostics.Value("warnings").IsArray() Then
+        StdErr.WriteLine("buoy-run repl: malformed compiler diagnostics: expected errors and warnings arrays")
+        Return False
+    End If
+    For Each kind As String In ["errors", "warnings"]
+        Dim entries As JSONItem = diagnostics.Value(kind)
+        For i As Integer = 0 To entries.Count() - 1
+            Dim item As JSONItem = entries.ValueAt(i)
+            Dim location As String = item.Value("file").AsString().Or("")
+            Dim line As Integer = item.Value("line").AsNumber().Or(0)
+            If String.Compare(location, source.FullPath(), True) = 0 Then
+                If line <= definitionLines Then
+                    location = "definitions"
+                Else
+                    line = Math.Max(1, line - offset)
+                    location = "submission"
+                End If
+            End If
+            StdErr.WriteLine(kind + ": " + location + ":" + Str(line) + ": " + item.Value("message").AsString().Or("unknown diagnostic"))
+        Next
+    Next
+    If checked <> 0 Or diagnostics.Value("errors").Count() <> 0 Then Return False
+    If validationOnly Then Return True
+    Dim binary As FileSystemItem = work.Child("program")
+    If Status(ReplSystem(command + " -o " + Q(binary.FullPath()))) <> 0 Then Return False
+    StdOut.Flush()
+    Dim exitStatus As Integer = Status(ReplSystem(Q(binary.FullPath())))
+    If exitStatus <> 0 Then
+        StdErr.WriteLine("Program exited with status " + Str(exitStatus))
+        Return False
+    End If
+    Return True
+End Function
+
+' Tracks input boundaries only. The real compiler remains the syntax authority.
+Class ReplInput
+    Public Property Frames As Array Of String = []
+    Public Property LogicalTokens As Array Of String = []
+    Public Property InComment As Boolean = False
+    Public Property Continued As Boolean = False
+    Public Property Broken As Boolean = False
+    Public Property FirstStatement As Boolean = True
+    Public Property Definition As Boolean = False
+    Public Property Program As Boolean = False
+    Public Property AwaitingProperty As Boolean = False
+
+    Public Function IsWord(ch As String) As Boolean
+        Return String.Contains("abcdefghijklmnopqrstuvwxyz0123456789_", String.LCase(ch), True)
+    End Function
+
+    Public Function Tokens(line As String) As Array Of String
+        Dim items As Array Of String = []
+        Dim i As Integer = 0
+        While i < String.Len(line)
+            Dim ch As String = String.Substring(line, i, 1)
+            Dim pair As String = String.Substring(line, i, 2)
+            If InComment Then
+                If pair = "*/" Then
+                    InComment = False
+                    i = i + 2
+                Else
+                    i = i + 1
+                End If
+            ElseIf ch = "'" Or pair = "//" Then
+                Exit While
+            ElseIf pair = "/*" Then
+                InComment = True
+                i = i + 2
+            ElseIf ch = "\"" Then
+                i = i + 1
+                Dim closed As Boolean = False
+                While i < String.Len(line)
+                    ch = String.Substring(line, i, 1)
+                    i = i + 1
+                    If ch = "\\" Then
+                        i = i + 1
+                    ElseIf ch = "\"" Then
+                        closed = True
+                        Exit While
+                    End If
+                End While
+                items.Append("<string>")
+                If Not closed Then Broken = True
+            ElseIf ch = " " Or ch = "\t" Or ch = "\r" Then
+                i = i + 1
+            ElseIf IsWord(ch) Then
+                Dim start As Integer = i
+                i = i + 1
+                While i < String.Len(line)
+                    If Not IsWord(String.Substring(line, i, 1)) Then Exit While
+                    i = i + 1
+                End While
+                items.Append(String.LCase(String.Substring(line, start, i - start)))
+            Else
+                items.Append(ch)
+                i = i + 1
+            End If
+        End While
+        Return items
+    End Function
+
+    Public Sub CloseFrame(kind As String)
+        If Frames.Count = 0 Then
+            Broken = True
+        ElseIf Frames(Frames.Count - 1) <> kind Then
+            Broken = True
+        Else
+            Array.ResizeTo(Frames, Frames.Count - 1)
+        End If
+    End Sub
+
+    Public Sub Statement(words As Array Of String)
+        If words.Count = 0 Then Exit Sub
+        Dim at As Integer = 0
+        While at < words.Count
+            If Not String.Contains("|public|private|protected|internal|shared|overrides|overridable|abstract|final|inline|async|export|sequential|packed|flags|readonly|optional|", "|" + words(at) + "|", True) Then Exit While
+            at = at + 1
+        End While
+        If at >= words.Count Then Exit Sub
+        Dim head As String = words(at)
+        Dim after As String = ""
+        If at + 1 < words.Count Then after = words(at + 1)
+        If FirstStatement Then
+            Definition = String.Contains("|function|sub|class|interface|structure|enum|namespace|import|const|declare|delegate|closure|", "|" + head + "|", True)
+            Program = (head = "function" Or head = "sub") And after = "main"
+            If Program Then Definition = False
+            FirstStatement = False
+        End If
+        Dim container As String = ""
+        For i As Integer = Frames.Count - 1 To 0 Step -1
+            If Frames(i) <> "#if" Then
+                container = Frames(i)
+                Exit For
+            End If
+        Next
+        If head = "#" Then
+            If after = "if" Then
+                Frames.Append("#if")
+            ElseIf after = "end" Then
+                CloseFrame("#if")
+            End If
+            Exit Sub
+        End If
+        If container = "structure" And after = "as" Then Exit Sub
+        If head = "end" And after <> "=" Then
+            If container = "enum" And after = "" Then after = "enum"
+            If after = "flags" Then after = "enum"
+            CloseFrame(after)
+            AwaitingProperty = False
+            Exit Sub
+        End If
+        ' Enum members may be keyword-named, e.g. Next = 2.
+        If container = "enum" Then Exit Sub
+        If head = "next" Then
+            CloseFrame("for")
+            Exit Sub
+        ElseIf head = "wend" Then
+            CloseFrame("while")
+            Exit Sub
+        ElseIf head = "loop" Then
+            CloseFrame("do")
+            Exit Sub
+        End If
+        ' A short Property is auto-implemented unless followed by Get/Set.
+        If head = "get" Or head = "set" Then
+            If AwaitingProperty Then Frames.Append("property")
+            Frames.Append(head)
+            AwaitingProperty = False
+            Exit Sub
+        End If
+        AwaitingProperty = head = "property"
+        If head = "function" Or head = "sub" Or head = "handle" Or head = "operator" Then
+            If container <> "interface" And Not ArrayHas(words, "abstract") Then Frames.Append(head)
+        ElseIf String.Contains("|class|interface|structure|enum|namespace|try|synclock|", "|" + head + "|", True) Then
+            Frames.Append(head)
+        ElseIf head = "if" Then
+            Dim depth As Integer = 0
+            For i As Integer = at + 1 To words.Count - 1
+                If words(i) = "(" Then depth = depth + 1
+                If words(i) = ")" Then depth = depth - 1
+                If words(i) = "then" And depth = 0 And words(i - 1) <> "." Then
+                    If i = words.Count - 1 Then Frames.Append("if")
+                    Exit For
+                End If
+            Next
+        ElseIf head = "for" Or head = "while" Or head = "do" Then
+            ' Keyword-named structure fields are signatures, not statements.
+            If after <> "as" Then Frames.Append(head)
+        ElseIf head = "select" And after = "case" Then
+            Frames.Append("select")
+        End If
+        ' Lambda/Block literals may start on an assignment or Return line.
+        For i As Integer = 0 To words.Count - 1
+            If words(i) = "lambda" Or words(i) = "block" Then
+                If i = 0 Then
+                    Frames.Append(words(i))
+                ElseIf words(i - 1) = "=" Or words(i - 1) = "return" Or words(i - 1) = "(" Or words(i - 1) = "," Then
+                    Frames.Append(words(i))
+                End If
+            End If
+        Next
+    End Sub
+
+    Public Function ArrayHas(words As Array Of String, value As String) As Boolean
+        For Each word As String In words
+            If word = value Then Return True
+        Next
+        Return False
+    End Function
+
+    Public Function AddLine(line As String) As Boolean
+        Dim words As Array Of String = Tokens(line)
+        If Continued And words.Count = 0 Then Broken = True
+        Continued = False
+        If words.Count > 0 Then
+            If words(words.Count - 1) = "_" And String.EndsWith(String.RTrim(line), "_", True) Then
+                Continued = True
+                Array.ResizeTo(words, words.Count - 1)
+            End If
+        End If
+        For Each word As String In words
+            LogicalTokens.Append(word)
+        Next
+        If Not Continued And Not InComment Then
+            Statement(LogicalTokens)
+            LogicalTokens = []
+        End If
+        Return Not Broken And (Frames.Count > 0 Or Continued Or InComment)
+    End Function
+End Class
+
+Public Function RunRepl() As Integer
+    Dim work As FileSystemItem
+    Try
+        Dim compiler As String = System.EnvironmentVariable("BUOY_RUN_BUOY").Or(System.EnvironmentVariable("AHOY_BUOY").Or("buoy"))
+        Dim setup As New Shell()
+        Dim cwd As String = ""
+        Try
+            setup.Execute(Q(compiler) + " --version")
+            If setup.LastExitCode <> 0 Then
+                StdErr.WriteLine("buoy-run repl: cannot run compiler " + compiler)
+                Return 1
+            End If
+            cwd = String.Trim(setup.Execute("pwd -P"))
+            Dim tempRoot As String = System.EnvironmentVariable("TMPDIR").Or("/tmp")
+            Dim location As String = String.Trim(setup.Execute("mktemp -d " + Q(Path.Join(tempRoot, "buoy-run-repl-XXXXXX"))))
+            If setup.LastExitCode <> 0 Then Throw New Exception("Cannot create REPL workspace")
+            work = New FileSystemItem(location)
+        Finally
+            setup.Close()
+        End Try
+        ' Make project packages available without copying app resource manifests.
+        Dim ancestor As New FileSystemItem(cwd)
+        While ancestor <> Nil
+            If ancestor.Child("packages").IsFolder() Then
+                Dim linked As Integer = Status(ReplSystem("ln -s " + Q(ancestor.Child("packages").FullPath()) + " " + Q(work.Child("packages").FullPath())))
+                If linked <> 0 Then Throw New Exception("Cannot link REPL packages")
+                Exit While
+            End If
+            ancestor = ancestor.Parent
+        End While
+        Dim terminal As Boolean = ReplIsTerminal(0) <> 0
+        If terminal Then
+            StdErr.WriteLine("Ahoy Buoy scratchpad. :help for commands, :quit to exit.")
+            StdErr.WriteLine("Fresh process per submission. Buoy keywords close blocks; definitions are remembered.")
+        End If
+        Dim inputState As New ReplInput()
+        Dim definitions As String = ""
+        Dim explicitBlock As Boolean = False
+        Dim collecting As Boolean = False
+        Dim complete As Boolean = False
+        Dim pending As String = ""
+        Dim previous As String = ""
+        Dim previousComplete As Boolean = False
+        While True
+            If terminal Then
+                If collecting Then
+                    ReplWrite(2, "... ", 4)
+                Else
+                    ReplWrite(2, "buoy-run> ", 10)
+                End If
+                StdErr.Flush()
+            End If
+            Dim nextLine As Optional Of String = StdIn.ReadLine()
+            If Not nextLine.HasValue Then
+                If collecting Then StdErr.WriteLine("Discarded unfinished block; close its Buoy block or use :end to submit.")
+                Exit While
+            End If
+            Dim line As String = nextLine.Value
+            Dim trimmed As String = String.Trim(line)
+            If Not inputState.InComment Or trimmed = ":cancel" Or trimmed = ":reset" Or trimmed = ":quit" Or trimmed = ":q" Then
+                If trimmed = ":quit" Or trimmed = ":q" Then Exit While
+                If trimmed = ":help" Then
+                    ReplHelp()
+                    Continue While
+                End If
+                If trimmed = ":defs" Then
+                    StdOut.Write(definitions)
+                    Continue While
+                End If
+                If trimmed = ":show" Then
+                    If collecting Then
+                        StdOut.Write(pending)
+                    Else
+                        StdOut.Write(previous)
+                    End If
+                    Continue While
+                End If
+                If trimmed = ":cancel" Or trimmed = ":reset" Then
+                    pending = ""
+                    collecting = False
+                    complete = False
+                    inputState = New ReplInput()
+                    explicitBlock = False
+                    If trimmed = ":reset" Then
+                        previous = ""
+                        definitions = ""
+                    End If
+                    Continue While
+                End If
+                If trimmed = ":begin" Or trimmed = ":program" Then
+                    If collecting Then
+                        StdErr.WriteLine("Already collecting a block; use :end or :cancel.")
+                    Else
+                        collecting = True
+                        explicitBlock = True
+                        inputState = New ReplInput()
+                        complete = trimmed = ":program"
+                        pending = ""
+                    End If
+                    Continue While
+                End If
+                If trimmed = ":run" Then
+                    If collecting Then
+                        StdErr.WriteLine("Close the Buoy block, or use :end to submit it explicitly.")
+                    ElseIf previous = "" Then
+                        StdErr.WriteLine("No successful submission to rerun.")
+                    Else
+                        Evaluate(previous, previousComplete, work, compiler, cwd, definitions)
+                    End If
+                    Continue While
+                End If
+                If trimmed = ":end" Then
+                    If Not collecting Then
+                        StdErr.WriteLine("No block is being collected.")
+                    Else
+                        If Not explicitBlock And inputState.Definition Then
+                            If Evaluate(pending, True, work, compiler, cwd, definitions, True) Then definitions = definitions + pending
+                        ElseIf Evaluate(pending, complete Or inputState.Program, work, compiler, cwd, definitions) Then
+                            previous = pending
+                            previousComplete = complete Or inputState.Program
+                        End If
+                        collecting = False
+                        explicitBlock = False
+                        inputState = New ReplInput()
+                        complete = False
+                        pending = ""
+                    End If
+                    Continue While
+                End If
+                If String.StartsWith(trimmed, ":", True) Then
+                    StdErr.WriteLine("Unknown command: " + trimmed + ". Use :help.")
+                    Continue While
+                End If
+            End If
+            If Not collecting And trimmed = "" Then Continue While
+            If Not collecting And String.StartsWith(trimmed, "?", True) Then
+                line = "Print " + String.Substring(trimmed, 1)
+            End If
+            pending = pending + line + "\n"
+            Dim more As Boolean = inputState.AddLine(line)
+            If explicitBlock Then Continue While
+            collecting = more
+            If collecting Then Continue While
+            If inputState.Definition Then
+                If Evaluate(pending, True, work, compiler, cwd, definitions, True) Then
+                    definitions = definitions + pending
+                End If
+            Else
+                If Evaluate(pending, inputState.Program, work, compiler, cwd, definitions) Then
+                    previous = pending
+                    previousComplete = inputState.Program
+                End If
+            End If
+            pending = ""
+            inputState = New ReplInput()
+        End While
+        Return 0
+    Catch error As Exception
+        StdErr.WriteLine("buoy-run repl: " + error.Message)
+        Return 1
+    Finally
+        If work <> Nil Then ReplSystem("/bin/rm -rf " + Q(work.FullPath()))
+    End Try
+End Function
