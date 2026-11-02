@@ -1,4 +1,4 @@
-# Run Buoy scripts and an interactive scratchpad
+# Compile and run .bui scripts with argument forwarding, temporary builds and an interactive scratchpad
 
 `buoy-run` compiles a script into a private temporary directory, runs it, forwards
 its exit status and removes the temporary build. It preserves the caller's
@@ -42,7 +42,5 @@ On your own machine, install Buoy and run:
 ```sh
 buoy ai init --both
 ```
-
-The generated agent files and editor settings stay local and are ignored by Git.
 
 [Contributing](CONTRIBUTING.md) · [License](LICENSE)

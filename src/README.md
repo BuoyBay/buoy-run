@@ -63,24 +63,15 @@ Each invocation recompiles; there is no executable cache. Desktop app bundles an
 project-specific build flags/manifests are outside this small console runner's
 scope. Temporary executable resources disappear when the invocation finishes.
 
-## Workspace helpers
+## Project helpers
 
-Selected Python and command-line JavaScript helpers have buoy-run entrypoints. See
-the [existing helper mapping](HELPERS.md) and [workspace script ports](https://github.com/BuoyBay/devtools/blob/main/tools/BuoyScripts.md)
-for dependencies, parity checks, and current limits. The DOM/Markdown operations
-retain Node.
+Use the runner for your own Buoy automation entrypoints. Keep helper source,
+configuration and assets in the project and pass their paths explicitly.
+[Helper usage](HELPERS.md) describes arguments, imports and external engines.
 
-Helpers importing `helper_runtime` are compiled in an isolated source tree. This
-retains imports between `tools/` and `tests/` while keeping the two desktop apps'
-resource manifests out of helper compilation. All helper data and output paths
-resolve against the original workspace through `AHOY_SCRIPT`.
-
-## Verification
-
-
-Checks compiler diagnostics and real launches covering input/EOF, separate output
-streams, literal arguments, exit codes, local imports, package imports, executable
-shebang launch, missing inputs/compiler, compile failures, and build cleanup.
+Scripts importing `helper_runtime` use an isolated source tree for shared helper
+modules. Data/output paths still resolve against the original workspace through
+`BUOY_RUN_SCRIPT` (with `AHOY_SCRIPT` retained as an alias).
 
 ## Interactive scratchpad
 
@@ -137,10 +128,6 @@ mixing a piped command session with program stdin reads, since both consume the
 same input stream. Ctrl-C interrupts a running program; use `:quit` to finish the
 session normally.
 
-Run the REPL checks with `buoy-run tests/run_repl_tests.bui`.
-
 The former Ahoy script runner is now `buoy-run`; Ahoy names the developer
 toolkit. The source layout and the `AHOY_BUOY`, `AHOY_PACKAGES`,
 and `AHOY_SCRIPT` environment variables remain supported for compatibility.
-
-Test suites and fixtures are maintainer-local and are not part of this public repository.
