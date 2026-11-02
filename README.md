@@ -35,12 +35,4 @@ This implementation uses POSIX utilities/libc and supports macOS and Linux.
 original script path. The former `AHOY_*` variables remain compatibility aliases.
 [Ahoy](https://github.com/BuoyBay/ahoy) is the developer toolkit.
 
-## Local Buoy setup
-
-On your own machine, install Buoy and run:
-
-```sh
-buoy ai init --both
-```
-
 [Contributing](CONTRIBUTING.md) · [License](LICENSE)
