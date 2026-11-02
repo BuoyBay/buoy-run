@@ -1,4 +1,4 @@
-# .bui runner — args, temp builds, scratchpad
+# Run .bui scripts
 
 `buoy-run` compiles a script into a private temporary directory, runs it, forwards
 its exit status and removes the temporary build. It preserves the caller's
